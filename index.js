@@ -1,6 +1,6 @@
 const ReadyResource = require('ready-resource')
 const safetyCatch = require('safety-catch')
-const { isMac } = require('which-runtime')
+const { isMac, isAndroid, isIOS } = require('which-runtime')
 
 const BLETransport = require('./lib/transport')
 
@@ -97,21 +97,32 @@ module.exports = class BluetoothSwarm extends ReadyResource {
     if (this.transport && !this.transport.radioCycled) {
       this.transport.resume()
     } else {
-      this._abandon()
+      const retiring = this._abandon()
+      if (isAndroid) {
+        await retiring
+        if (this.transport || !this.started || this.suspended || this.closing || this.closed) return
+      }
       this.transport = this._createTransport()
       await this.transport.ready()
     }
   }
 
+  // Android hands a power-cycled server's handle to the next server that
+  // registers, so there the old managers must be destroyed before new ones
+  // exist, or closing the old server unregisters the new one.
   _abandon() {
     const old = this.transport
     if (!old) return
     this.transport = null
-    old
+    return old
       .suspend()
       .catch(safetyCatch)
       .then(() => {
-        if (isMac) old.destroyManagers()
+        if (isMac || isAndroid) old.destroyManagers()
+        // iOS keeps a manager's services through a power cycle and can't destroy it, removeAllServices is Apple only
+        else if (isIOS && typeof old.server?.removeAllServices === 'function') {
+          old.server.removeAllServices()
+        }
       })
   }
 
@@ -131,10 +142,15 @@ module.exports = class BluetoothSwarm extends ReadyResource {
   }
 
   // A radio power cycle wedges the surviving native managers — abandon them
-  // (never destroy: native double-free) and start over with fresh ones.
+  // (destroyed only where that is safe, see destroyManagers) and start over
+  // with fresh ones.
   async _rebuild(old) {
     if (this.transport !== old || this.closing || this.closed) return
-    this._abandon()
+    const retiring = this._abandon()
+    if (isAndroid) {
+      await retiring
+      if (this.transport || this.closing || this.closed) return
+    }
     if (this.started && !this.suspended) {
       this.transport = this._createTransport()
       await this.transport.ready().catch(safetyCatch)
