@@ -12,7 +12,7 @@ const backend = loadBackend()
 function loadBackend() {
   try {
     return require('#bluetooth')
-  } catch {
+  } catch (err) {
     console.error('[ble-swarm] failed to load:', err)
     return null
   }
