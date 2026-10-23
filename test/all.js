@@ -945,7 +945,7 @@ test('suspend and stop clear discovered', async (t) => {
   t.alike(a.discovered, [], 'cleared on stop')
 })
 
-test('a device whose radio goes away is not left listed', async (t) => {
+test('a device whose link drops stays listed until it ages out', async (t) => {
   const backend = makeMockBluetooth()
   const a = createSwarm(t, backend)
   const neverDials = createSwarm(t, backend, { maxOutbound: 0 })
@@ -956,7 +956,14 @@ test('a device whose radio goes away is not left listed', async (t) => {
   neverDials.transport.server.stopAdvertising()
   neverDials.transport._destroyPeers()
   await until(() => a.connections.size === 0)
-  t.alike(a.discovered, [], 'gone with its link')
+  t.is(a.discovered.length, 1, 'it may well still be advertising')
+  t.is(a.discovered[0].linked, false)
+
+  a.transport._endScanWindow()
+  a.transport._endScanWindow()
+  t.is(a.discovered.length, 1, 'kept through the first window it went unheard')
+  a.transport._endScanWindow()
+  t.is(a.discovered.length, 0)
 })
 
 test('a replayed discovery is not a new hearing', async (t) => {
@@ -985,4 +992,154 @@ test('a scheduled scan stop completes the window', async (t) => {
   const before = tr._scanWindows
   tr._stopScan(true)
   t.is(tr._scanWindows, before + 1)
+})
+
+test('an entry is linked only once its link is up', async (t) => {
+  const backend = makeMockBluetooth()
+  const a = createSwarm(t, backend, { maxOutbound: 0 })
+  await a.start()
+
+  const tr = a.transport
+  quiet(tr)
+  hear(tr, 'x')
+  tr._identify('x', b4a.from(KEY_A, 'hex'))
+  tr._device('x').linked = true
+  t.is(a.discovered[0].linked, false, 'the channel is bound but the handshake is not done')
+})
+
+test('a peer refused by policy is still identified', async (t) => {
+  const backend = makeMockBluetooth()
+  const a = createSwarm(t, backend, { shouldConnect: () => false })
+  const b = createSwarm(t, backend, { maxOutbound: 0 })
+  await a.start()
+  await b.start()
+
+  await until(() => a.discovered.length === 1 && a.discovered[0].publicKey !== null)
+  t.alike(a.discovered[0].publicKey, b.transport.keyPair.publicKey)
+  t.is(a.discovered[0].linked, false)
+})
+
+test('a peer that dialed us is listed without its key', async (t) => {
+  const backend = makeMockBluetooth()
+  const a = createSwarm(t, backend, { maxOutbound: 0 })
+  const b = createSwarm(t, backend)
+  await a.start()
+  await b.start()
+  await until(() => a.connections.size === 1 && a.discovered.length === 1)
+
+  t.is(a.discovered[0].publicKey, null, 'a central gives our server no address to match')
+  t.is(a.discovered[0].linked, false)
+})
+
+test('clearing discovered also forgets what was re-heard', async (t) => {
+  const backend = makeMockBluetooth()
+  const a = createSwarm(t, backend, { maxOutbound: 0 })
+  await a.start()
+
+  const tr = a.transport
+  quiet(tr)
+  hear(tr, 'x')
+  tr._endScanWindow()
+  hear(tr, 'x')
+  tr._clearDeviceTimers()
+
+  let updates = 0
+  a.on('update', () => updates++)
+  tr._endScanWindow()
+  t.is(updates, 0)
+})
+
+function helloFrom(tr, id, key) {
+  const { TYPE_HELLO, encodeFrame, encodeKeyPayload } = require('../lib/frames')
+  const sid = 'a1b2c3d4e5f60718'
+  const peripheral = { id, _session: { id: sid } }
+  tr._sendClose = () => {}
+  tr._disconnect = () => {}
+  return tr._onCentralNotify(peripheral, encodeFrame(TYPE_HELLO, sid, encodeKeyPayload(key, 0)))
+}
+
+test('our own reflection is not identified', async (t) => {
+  const backend = makeMockBluetooth()
+  const a = createSwarm(t, backend, { maxOutbound: 0 })
+  await a.start()
+
+  const tr = a.transport
+  quiet(tr)
+  hear(tr, 'x')
+  await helloFrom(tr, 'x', tr.keyPair.publicKey)
+  t.is(a.discovered[0].publicKey, null)
+})
+
+test('a malformed key is not identified', async (t) => {
+  const backend = makeMockBluetooth()
+  const a = createSwarm(t, backend, { maxOutbound: 0 })
+  await a.start()
+
+  const tr = a.transport
+  quiet(tr)
+  hear(tr, 'x')
+  await helloFrom(tr, 'x', b4a.alloc(16, 1))
+  t.is(a.discovered[0].publicKey, null)
+})
+
+test('turning the radio off announces the emptied list', async (t) => {
+  const backend = makeMockBluetooth()
+  const a = createSwarm(t, backend, { maxOutbound: 0 })
+  await a.start()
+
+  const tr = a.transport
+  quiet(tr)
+  hear(tr, 'x')
+  const announced = []
+  a.on('update', () => announced.push(a.discovered.length))
+  setRadioState(a, 'poweredOff')
+  t.ok(announced.length > 0)
+  t.ok(
+    announced.every((count) => count === 0),
+    'no update carries the list from before the wipe'
+  )
+})
+
+test('a radio going off after resetting still announces the emptied list', async (t) => {
+  const backend = makeMockBluetooth()
+  const a = createSwarm(t, backend, { maxOutbound: 0 })
+  await a.start()
+
+  const tr = a.transport
+  quiet(tr)
+  setRadioState(a, 'resetting')
+  hear(tr, 'x')
+  const announced = []
+  a.on('update', () => announced.push(a.discovered.length))
+  setRadioState(a, 'poweredOff')
+  t.alike(announced, [0])
+})
+
+test('a refused HELLO identifies the device by the key it claims', async (t) => {
+  const backend = makeMockBluetooth()
+  const a = createSwarm(t, backend, { maxOutbound: 0 })
+  await a.start()
+
+  const tr = a.transport
+  quiet(tr)
+  hear(tr, 'x')
+  await helloFrom(tr, 'x', b4a.from(KEY_A, 'hex'))
+  t.alike(a.discovered[0].publicKey, b4a.from(KEY_A, 'hex'))
+})
+
+test('a HELLO refused by policy is identified by its key even when that peer is linked', async (t) => {
+  const backend = makeMockBluetooth()
+  const a = createSwarm(t, backend, { maxOutbound: 0, shouldConnect: () => false })
+  await a.start()
+
+  const tr = a.transport
+  quiet(tr)
+  tr.peers.set(KEY_A, { destroy() {} })
+  hear(tr, 'x')
+  await helloFrom(tr, 'x', b4a.from(KEY_A, 'hex'))
+  t.alike(
+    a.discovered[0].publicKey,
+    b4a.from(KEY_A, 'hex'),
+    'a policy may refuse a peer it reaches another way'
+  )
 })
